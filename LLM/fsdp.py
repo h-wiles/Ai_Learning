@@ -1,147 +1,176 @@
 import torch
-import torch.distributed as dist
 import torch.nn as nn
+import torch.distributed as dist
 import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
-# 初始化分布式环境
-def init_distribute():
-    if not dist.is_initialized():
-        dist.init_process_group(backend='nccl' if torch.cuda.is_available() else 'gloo')
-
-# 简化版FSDP封装器
-class SimpleFSDP(nn.Module):
-    def __init__(self, module:nn.Module):
+# ---------- 简化版 FSDP ----------
+class MyFSDP(nn.Module):
+    def __init__(self, module: nn.Module):
         super().__init__()
         self.module = module
-        self.rank = dist.get_rank()     # 当前进程rank
-        self.world_size = dist.get_world_size()     # 总进程数
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
 
-        # 对模型参数进行分片，每个进程只保留自己的分片
-        self.param_shards = self._shard_parameters()
+        # 保存每个参数的完整形状和分片副本
+        self.full_shapes = {}
+        self.shard_backup = {}   # 每次 forward 前备份分片数据，用于 backward 后恢复
 
-        # 临时存储组装后的完整参数（仅在计算时用，计算后释放）
-        self.full_params = None
+        # 替换模型参数为分片
+        for name, param in module.named_parameters():
+            full_shape = param.shape
+            self.full_shapes[name] = full_shape
+            if full_shape[0] % self.world_size != 0:
+                raise ValueError(f"Parameter {name} first dimension {full_shape[0]} not divisible by world_size {self.world_size}")
 
-    def _shard_parameters(self):
-        """
-        将模型参数按维度分片，每个进程持有一部分
-        """
-        param_shards = {}
-        for name, param in self.module.named_parameters():
-            # 将参数按第一个维度均分，实际上FSDP会按照nume1分
-            shard_size = param.size(0)  // self.world_size  # 计算每个进程的shard_size
-
-            # 计算当前进程的分片范围
+            # 计算当前 rank 的分片
+            shard_size = full_shape[0] // self.world_size
             start = self.rank * shard_size
-            end = start + shard_size if self.rank != self.world_size - 1 else param.size(0)
+            end = start + shard_size
+            shard_data = param.data[start:end].clone()
 
-            # 每个进程只保留自己的分片（深拷贝，避免引入完整参数）
-            param_shards[name] = param.data[start:end].clone()
-
-            # 释放原始参数的显存，只保留分片
-            del param
-
-        return param_shards
+            # 用分片数据替换原参数
+            param.data = shard_data   # 此时 param 变为分片
 
     def _gather_full_params(self):
-        """
-        通过all_gather组装完整参数（前向计算时调用）
-        """
-        self.full_params = {}
-        for name, shard in self.param_shards.items():
-            # 初始化完整参数的存储
-            full_param = torch.zeros(
-                self._get_full_param_size(name),
-                dtype=shard.dtype,
-                device=shard.device,
-            )
-            dist.all_gather(
-                list(full_param.chunk(self.world_size, dim=0)),
-                shard
-            )
-            self.full_params[name] = full_param
+        """收集所有分片，组装完整参数并临时赋值给模型"""
+        for name, param in self.module.named_parameters():
+            full_shape = self.full_shapes[name]
+            # 创建完整大小的零张量
+            full_tensor = torch.zeros(full_shape, dtype=param.dtype, device=param.device)
+            # 将 full_tensor 按第一维切成 world_size 个块，用于接收
+            tensor_list = list(full_tensor.chunk(self.world_size, dim=0))
+            # All-Gather：每个进程把自己的分片填入对应块
+            dist.all_gather(tensor_list, param)
+            # 将完整张量赋给参数（替换原分片）
+            param.data = full_tensor
 
-    def _get_full_param_size(self, name):
-        """
-        获取参数的完整尺寸。简化版，实际上可以通过通信获取
-        """
-        # 简化：假如所有进程知道完整参数尺寸，这里模拟原始参数尺寸
-        if "weight" in name:
-            return torch.Size([1024, 512])
-        elif "bias" in name:
-            return torch.Size([1024])
-        return shard.size()
+    def _restore_sharded_params(self):
+        """恢复参数为分片（使用备份的分片数据）"""
+        for name, param in self.module.named_parameters():
+            # 恢复为 forward 前备份的分片数据
+            param.data = self.shard_backup[name]
 
     def forward(self, x):
-        # 1, 前向计算前：组装完整参数
+        # 1. 备份当前分片数据（用于反向后恢复）
+        for name, param in self.module.named_parameters():
+            self.shard_backup[name] = param.data.clone()
+
+        # 2. 收集完整参数并赋值
         self._gather_full_params()
 
-        # 2, 将完整参数赋值给模型，执行前向计算
-        for name, param in self.module.named_parameters():
-            param.data = self.full_params[name]
-
+        # 3. 执行前向计算
         out = self.module(x)
 
-        # 3, 计算后释放完整参数，节省显存
-        self.full_params = None
+        # 注意：这里不恢复分片，因为反向传播需要完整参数计算梯度
         return out
 
     def backward(self, loss):
-        """
-        反向传播+梯度分片聚合，简化版
-        """
-        # 1，反向计算梯度
+        """自定义反向传播：计算梯度，聚合梯度，恢复分片"""
+        # 1. 反向传播，此时参数是完整的，梯度会计算到 param.grad
         loss.backward()
 
-        # 2, 对梯度进行分片，只保留自己的分片
-        grad_shards = {}
-
+        # 2. 对每个参数进行梯度分片聚合
         for name, param in self.module.named_parameters():
-            shard_size = param.size(0) // self.world_size
-            start = self.rank * shard_size
-            end = start + shard_size if self.rank != self.world_size - 1 else param.grad.size(0)
-            grad_shards[name] = param.grad[start:end].clone()
+            # 完整梯度
+            full_grad = param.grad
+            if full_grad is None:
+                continue
 
-        # 3, reduce_scatter聚合梯度（各进程只保留自己分片的全局梯度）
-        for name, grad_shard in grad_shards.items():
-            dist.reduce_scatter(
-                grad_shard,
-                list(self._get_full_param_size(name).chunk(self.world_size, dim=0)),
-                op=dist.ReduceOp.SUM,
+            # 切分成 world_size 块
+            grad_chunks = list(full_grad.chunk(self.world_size, dim=0))
+
+            # 创建输出张量（分片大小）
+            shard_size = self.full_shapes[name][0] // self.world_size
+            shard_grad = torch.zeros(
+                (shard_size, *self.full_shapes[name][1:]),
+                dtype=full_grad.dtype,
+                device=full_grad.device
             )
 
-        # 4, 更新本地参数分片，优化器只更新分片
-        self._update_param_shards(grad_shards)
+            # Reduce-Scatter：各进程将自己的块列表聚合到对应 rank，得到自己的分片梯度
+            dist.reduce_scatter(shard_grad, grad_chunks, op=dist.ReduceOp.SUM)
 
-    def _get_full_grad(self, name):
-        """
-        获取完整梯度，简化版
-        """
-        return self.module.named_parameters()[name].grad
+            # 3. 将分片梯度赋值给参数（param 当前还是完整张量，但 grad 会被替换）
+            #    同时恢复参数为分片数据（用备份）
+            param.grad = shard_grad
+            param.data = self.shard_backup[name]
 
-    def _update_param_shards(self, grad_shards, lr=1e-3):
-        """
-        用聚合后的梯度分片更新本地参数分片
-        """
-        for name, shard in self.param_shards.items():
-            shard.data -= lr * grad_shards[name]
+        # 清理备份，释放显存（可选）
+        self.shard_backup.clear()
 
 
-if __name__ == '__main__':
-    # 初始化分布式
-    init_distribute()
+# ---------- 简单模型和数据 ----------
+class SimpleModel(nn.Module):
+    def __init__(self, input_dim=512, hidden_dim=1024):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)
 
-    # 1，定义简单模型（线性层为例）
-    model = nn.Linear(512, 1024).to(torch.device(f"cuda: {dist.get_rank()}")
-                                    if torch.cuda.is_available() else torch.device(f"cpu"))
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        return self.fc2(x).squeeze(1)
 
-    # 2, 用FSDP封装模型
-    fsdp_model = SimpleFSDP(model)
 
-    # 3, 模拟前向+反向
-    x = torch.randn(32, 512).to(next(fsdp_model.parameters()).device)
-    out = fsdp_model(x)
-    loss = out.sum()
-    fsdp_model.backward(loss)
-    print(f"Rank {fsdp_model.rank}: 参数分片尺寸{list(fsdp_model.param_shards['weight'].size())}")
+class DummyDataset(Dataset):
+    def __init__(self, size=1000, dim=512):
+        self.data = torch.randn(size, dim)
+        self.target = torch.randn(size)
 
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx], self.target[idx]
+
+
+# ---------- 主训练函数 ----------
+def train(rank, world_size):
+    # 初始化分布式环境
+    dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+    # 模型
+    model = SimpleModel().cuda(rank)
+    fsdp_model = MyFSDP(model)
+
+    # 优化器（直接传入分片参数）
+    optimizer = optim.SGD(fsdp_model.parameters(), lr=0.01)
+
+    # 数据集和分布式采样器
+    dataset = DummyDataset(size=200, dim=512)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=32, sampler=sampler)
+
+    # 训练循环
+    for epoch in range(2):
+        sampler.set_epoch(epoch)   # 确保 shuffle 不同
+        for batch_idx, (x, y) in enumerate(dataloader):
+            x, y = x.cuda(rank), y.cuda(rank)
+
+            # 前向
+            out = fsdp_model(x)
+            loss = nn.functional.mse_loss(out, y)
+
+            # 反向（自定义）
+            optimizer.zero_grad()   # 清空旧梯度
+            fsdp_model.backward(loss)
+
+            # 优化器更新分片参数
+            optimizer.step()
+
+            if rank == 0 and batch_idx % 10 == 0:
+                print(f"Epoch {epoch} Batch {batch_idx} Loss: {loss.item():.4f}")
+
+    # 清理
+    dist.destroy_process_group()
+
+
+def main():
+    world_size = torch.cuda.device_count()
+    torch.multiprocessing.spawn(train, args=(world_size,), nprocs=world_size, join=True)
+
+
+if __name__ == "__main__":
+    main()
